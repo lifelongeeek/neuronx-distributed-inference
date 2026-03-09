@@ -1,212 +1,135 @@
-"""
-Solar Open MoE Generation Demo (contrib version).
-
-This script demonstrates how to compile and run inference with the Solar Open MoE model
-using neuronx-distributed-inference. It uses the contrib src path directly.
-
-Based on examples/generation_glm4_moe_demo.py.
-
-Usage:
-    # Compile and generate:
-    python generation_solar_open_demo.py
-
-    # Skip compile (load from existing traced model):
-    python generation_solar_open_demo.py --skip-compile
-
-    # Custom paths:
-    python generation_solar_open_demo.py \\
-        --model-path /path/to/solar_open_model \\
-        --traced-model-path /path/to/traced_model
-"""
-
-import argparse
-import sys
-from pathlib import Path
-
-# Add contrib src to path so we can import solar_open directly
-sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
-
+import os
 import torch
 from transformers import AutoTokenizer, GenerationConfig
 
-from neuronx_distributed_inference.models.config import (
-    MoENeuronConfig,
-    OnDeviceSamplingConfig,
-)
-from solar_open.modeling_solar_open import (
-    SolarOpenInferenceConfig,
-    NeuronSolarOpenForCausalLM,
-    load_solar_open_config,
-)
-from neuronx_distributed_inference.utils.hf_adapter import (
-    HuggingFaceGenerationAdapter,
+from neuronx_distributed_inference.models.config import MoENeuronConfig
+from neuronx_distributed_inference.models.solar_open.modeling_solar_open_baseline_v0 import (
+    SolarOpenInferenceConfig, 
+    NeuronSolarOpenForCausalLM, 
+    load_solar_open_config
 )
 
-# Paths - update these to your model paths
-MODEL_PATH = "solar_open_tiny_random"
-TRACED_MODEL_PATH = "solar_open_tiny_random_traced"
+from neuronx_distributed_inference.utils.hf_adapter import HuggingFaceGenerationAdapter
 
-torch.manual_seed(0)
-
-DTYPE = torch.bfloat16
-
-
-def get_neuron_config(tp_degree: int = 2, seq_len: int = 64) -> MoENeuronConfig:
-    """Create MoENeuronConfig for Solar Open tiny model."""
-    return MoENeuronConfig(
-        tp_degree=tp_degree,
-        moe_tp_degree=1,
-        moe_ep_degree=1,
-        batch_size=1,
-        ctx_batch_size=1,
-        tkg_batch_size=1,
-        seq_len=seq_len,
-        max_context_length=seq_len - 16,
-        torch_dtype=DTYPE,
-        on_device_sampling_config=OnDeviceSamplingConfig(
-            do_sample=False,
-            top_k=1,
-        ),
-        enable_bucketing=False,
-        flash_decoding_enabled=False,
-        fused_qkv=True,
-        sequence_parallel_enabled=False,
-        qkv_kernel_enabled=False,
-        attn_kernel_enabled=False,
-    )
-
-
-def generate(model_path: str, traced_model_path: str, skip_compile: bool = False):
-    """Compile (if needed) and run Solar Open MoE inference."""
-    if not skip_compile:
-        print("=" * 60)
-        print("Compiling Solar Open MoE model...")
-        print("=" * 60)
-
-        neuron_config = get_neuron_config()
-        config = SolarOpenInferenceConfig(
-            neuron_config,
-            load_config=load_solar_open_config(model_path),
-        )
-
-        print(
-            f"  Model config: hidden_size={config.hidden_size}, "
-            f"n_routed_experts={config.n_routed_experts}, "
-            f"n_shared_experts={config.n_shared_experts}, "
-            f"num_experts_per_tok={config.num_experts_per_tok}"
-        )
-
-        model = NeuronSolarOpenForCausalLM(model_path, config)
-        model.compile(traced_model_path)
-
-        # Copy model weights to traced path so load() can find them
-        # (solar_open is not in transformers; checkpoint_loader_fn looks in _name_or_path first)
-        import shutil
-        import os
-
-        src_weights = os.path.join(model_path, "model.safetensors")
-        dst_weights = os.path.join(traced_model_path, "model.safetensors")
-        if os.path.exists(src_weights) and not os.path.exists(dst_weights):
-            shutil.copy2(src_weights, dst_weights)
-            print(f"Copied model weights to {traced_model_path}")
-
-        # Save tokenizer if available
-        try:
-            tokenizer = AutoTokenizer.from_pretrained(model_path)
-            tokenizer.save_pretrained(traced_model_path)
-        except Exception as e:
-            print(f"Warning: could not save tokenizer: {e}")
-
-        print(f"Model compiled and saved to {traced_model_path}")
-
-    # Load compiled model
-    print("\n" + "=" * 60)
-    print("Loading compiled Solar Open MoE model...")
-    print("=" * 60)
-    model = NeuronSolarOpenForCausalLM(traced_model_path)
-    model.load(traced_model_path)
-
-    # Try to load tokenizer
-    try:
-        tokenizer = AutoTokenizer.from_pretrained(traced_model_path)
-    except Exception:
-        try:
-            tokenizer = AutoTokenizer.from_pretrained(model_path)
-        except Exception:
-            tokenizer = None
-
-    # Generate
-    print("\n" + "=" * 60)
-    print("Generating outputs...")
-    print("=" * 60)
-
-    prompt = "What is the capital of France?"
-
-    if tokenizer is not None:
-        inputs = tokenizer([prompt], return_tensors="pt", padding=True)
-        input_ids = inputs.input_ids
-        attention_mask = inputs.attention_mask
-        print(f"Prompt: {prompt!r}")
-        print(f"Input token ids: {input_ids}")
-    else:
-        # Use dummy tokens if no tokenizer
-        input_ids = torch.tensor([[1, 2, 3, 4, 5]], dtype=torch.long)
-        attention_mask = torch.ones_like(input_ids)
-        print(f"Using dummy input_ids: {input_ids}")
-
-    try:
-        generation_config = GenerationConfig.from_pretrained(model_path)
-    except Exception:
-        generation_config = GenerationConfig(
-            max_new_tokens=10,
-            do_sample=False,
-            top_k=1,
-        )
-
-    generation_model = HuggingFaceGenerationAdapter(model)
-    outputs = generation_model.generate(
-        input_ids,
-        generation_config=generation_config,
-        attention_mask=attention_mask,
-        max_length=model.config.neuron_config.max_length,
-    )
-
-    print(f"Output token ids: {outputs}")
-
-    if tokenizer is not None:
-        decoded = tokenizer.batch_decode(outputs, skip_special_tokens=True)
-        print("Generated text:")
-        for i, text in enumerate(decoded):
-            print(f"  [{i}]: {text}")
-
-    return outputs
-
+MODEL_PATH = "/home/ubuntu/workspace/model_hf/Solar-Open-100B"
+TRACED_MODEL_PATH = "/home/ubuntu/workspace/neuronx-distributed-inference/traced_solar_open_100b_full_layer" 
 
 def main():
-    parser = argparse.ArgumentParser(description="Solar Open MoE generation demo")
-    parser.add_argument("--model-path", default=MODEL_PATH, help="Path to HF model")
-    parser.add_argument(
-        "--traced-model-path",
-        default=TRACED_MODEL_PATH,
-        help="Path to save/load traced model",
-    )
-    parser.add_argument(
-        "--skip-compile",
-        action="store_true",
-        help="Skip compilation, load existing traced model",
-    )
-    parser.add_argument(
-        "--tp-degree", type=int, default=2, help="Tensor parallelism degree"
-    )
-    parser.add_argument("--seq-len", type=int, default=64, help="Sequence length")
-    args = parser.parse_args()
-
-    generate(
-        model_path=args.model_path,
-        traced_model_path=args.traced_model_path,
-        skip_compile=args.skip_compile,
+    rank = int(os.environ.get("RANK", "0"))
+    
+    print("Initializing MoE Neuron Configuration for Trn1 (Generation Mode)...")
+    
+    os.environ["NEURON_CC_FLAGS"] = (
+        "--cache_dir=/home/ubuntu/workspace/compiler_cache "
+        "--enable-saturate-infinity "
+        "--model-type transformer -O1 "
+        "--tensorizer-options='--enable-ccop-compute-overlap --cc-pipeline-tiling-factor=2' "
+        "--auto-cast=none "
+        "--internal-enable-dge-levels vector_dynamic_offsets "
+        "--internal-hlo2tensorizer-options='--verify-hlo=true'"
     )
 
+    neuron_config = MoENeuronConfig(
+        tp_degree=32,                  
+        moe_ep_degree=1,                
+        moe_tp_degree=32,              
+        cp_degree=1,                   
+        attention_dp_degree=1,         
+        logical_nc_config=1,           
+        batch_size=1,
+        max_context_length=128,       
+        seq_len=512,
+        torch_dtype=torch.bfloat16,    
+        
+        fused_qkv=False,
+        qkv_kernel_enabled=False, 
+        sequence_parallel_enabled=False,
+        shared_experts_sequence_parallel_enabled=False, 
+        use_index_calc_kernel=False,
+        moe_mask_padded_tokens=True,
+        
+        blockwise_matmul_config={"use_shard_on_intermediate_dynamic_while": False, "skip_dma_token": True},
+        on_device_sampling_config=None,
+        async_mode=False, 
+        padding_side="right"
+    )
+
+    inference_config = SolarOpenInferenceConfig(
+        neuron_config=neuron_config,
+        load_config=load_solar_open_config(MODEL_PATH)
+    )
+
+    model = NeuronSolarOpenForCausalLM(MODEL_PATH, inference_config)
+    
+    if os.path.exists(TRACED_MODEL_PATH):
+        print(f"Loading compiled traced model from {TRACED_MODEL_PATH}...")
+        model.load(TRACED_MODEL_PATH)
+    else:
+        print(f"Traced model not found. Compiling the model to {TRACED_MODEL_PATH}...")
+        model.compile(TRACED_MODEL_PATH)
+        print(f"Loading the newly compiled model...")
+        model.load(TRACED_MODEL_PATH)
+
+    print("Loading Tokenizer...")
+        
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_PATH)
+    tokenizer.padding_side = "right"
+    
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    prompt = "Could you explain the concept of quantum computing in simple terms?"
+    messages = [{"role": "user", "content": prompt}]
+    
+    text = tokenizer.apply_chat_template(
+        messages, 
+        tokenize=False, 
+        add_generation_prompt=True
+    )
+    
+    inputs = tokenizer(
+        text, 
+        return_tensors="pt"
+    )
+    
+    input_length = inputs["input_ids"].shape[1]
+    print(f"\nGenerating outputs on Trainium Hardware... (Greedy Search, Max New Tokens: 384)")
+    
+    generation_config = GenerationConfig.from_pretrained(MODEL_PATH)
+    generation_config.do_sample = False
+    generation_config.temperature = 1.0
+    generation_config.top_p = 1.0
+    generation_config.top_k = 1
+    generation_config.max_new_tokens = 384  
+    generation_config.pad_token_id = tokenizer.pad_token_id
+    
+    stop_tokens = [tokenizer.eos_token_id]
+    if hasattr(tokenizer, "additional_special_tokens_ids") and tokenizer.additional_special_tokens_ids:
+        stop_tokens.extend(tokenizer.additional_special_tokens_ids)
+    for st in ["<|end|>", "<|im_end|>", "<|eot_id|>"]:
+        tid = tokenizer.convert_tokens_to_ids(st)
+        if tid is not None and tid != tokenizer.unk_token_id and tid not in stop_tokens:
+            stop_tokens.append(tid)
+
+    generation_config.eos_token_id = stop_tokens
+
+    generation_model = HuggingFaceGenerationAdapter(model)
+
+    with torch.no_grad():
+        outputs = generation_model.generate(
+            inputs["input_ids"],
+            attention_mask=inputs["attention_mask"],
+            generation_config=generation_config
+        )
+    
+    generated_tokens = outputs[0, input_length:]
+    generated_text = tokenizer.decode(generated_tokens, skip_special_tokens=True, clean_up_tokenization_spaces=False)
+    
+    print("\n================== NxDI Hardware Generation Result (100B Full-Layer) ==================")
+    print(generated_text)
+    print("=======================================================================================\n")
+    
+    torch.save(generated_tokens.cpu(), "nxdi_generated_tokens_full.pt")
 
 if __name__ == "__main__":
     main()
