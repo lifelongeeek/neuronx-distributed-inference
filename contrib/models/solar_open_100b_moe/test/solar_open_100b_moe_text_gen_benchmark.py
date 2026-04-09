@@ -4,6 +4,7 @@ import argparse
 import torch
 from transformers import AutoTokenizer, GenerationConfig
 
+os.environ["NEURON_PLATFORM_TARGET_OVERRIDE"] = "trn1"
 os.environ["NEURON_CC_FLAGS"] = (
     "--cache_dir=/var/tmp/compiler_cache "
     "--enable-saturate-infinity "
@@ -16,9 +17,10 @@ os.environ["NEURON_CC_FLAGS"] = (
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '../src'))
 from neuronx_distributed_inference.models.config import MoENeuronConfig, OnDeviceSamplingConfig
+
 from modeling_solar_open_100b_moe import (
-    SolarOpenInferenceConfig, 
-    NeuronSolarOpenForCausalLM, 
+    SolarOpenInferenceConfig,
+    NeuronSolarOpenForCausalLM,
     load_solar_open_config
 )
 
@@ -30,48 +32,84 @@ MODEL_PATH = "/home/ubuntu/workspace/model_hf/Solar-Open-100B"
 def main():
     parser = argparse.ArgumentParser(description="Solar-Open-100B NeuronX Inference")
     parser.add_argument(
-        "--num_layers", 
-        type=int, 
-        default=None, 
+        "--num_layers",
+        type=int,
+        default=None,
         help="Number of layers to compile and run (uses all layers if not provided)"
     )
-
     parser.add_argument(
-        "--batch_size", 
-        type=int, 
-        default=16, 
+        "--batch_size",
+        type=int,
+        default=16,
         help="Batch size for compilation and inference"
+    )
+    parser.add_argument(
+        "--quantized",
+        action="store_true",
+        help="Enable FP8 quantized inference (per_channel_symmetric, f8e4m3)"
+    )
+    parser.add_argument(
+        "--quantized_checkpoints_path",
+        type=str,
+        default=None,
+        help="Path to quantized checkpoints (auto-resolved if not specified)"
     )
     args = parser.parse_args()
 
+    if args.quantized:
+        os.environ["XLA_HANDLE_SPECIAL_SCALAR"] = "1"
+        os.environ["UNSAFE_FP8FNCAST"] = "1"
+
+    quant_tag = "_quant" if args.quantized else ""
     if args.num_layers is not None:
-        traced_model_path = f"/home/ubuntu/workspace/neuronx-distributed-inference/traced_solar_open_100b_{args.num_layers}layer"
+        traced_model_path = f"/home/ubuntu/workspace/neuronx-distributed-inference/traced_solar_open_100b_{args.num_layers}layer{quant_tag}"
         layer_info_str = f"{args.num_layers} Layers (EP=4, TP=8, BS={args.batch_size})"
     else:
-        traced_model_path = f"/home/ubuntu/workspace/neuronx-distributed-inference/traced_solar_open_100b_full_layer"
+        traced_model_path = f"/home/ubuntu/workspace/neuronx-distributed-inference/traced_solar_open_100b_full_layer{quant_tag}"
         layer_info_str = f"Full-Layer (EP=4, TP=8, BS={args.batch_size})"
 
+    if args.quantized:
+        if args.quantized_checkpoints_path:
+            quantized_path = args.quantized_checkpoints_path
+        elif args.num_layers:
+            quantized_path = f"/home/ubuntu/workspace/model_hf/Solar-Open-100B-f8e4m3-{args.num_layers}layer"
+        else:
+            quantized_path = "/home/ubuntu/workspace/model_hf/Solar-Open-100B-f8e4m3"
+
     print(f"Initializing MoE Neuron Configuration for Trn1 (Generation Mode, {layer_info_str})...")
-    
+    if args.quantized:
+        print(f"  Quantization: FP8 (f8e4m3, per_channel_symmetric)")
+        print(f"  Quantized checkpoints: {quantized_path}")
+
+    quant_kwargs = {}
+    if args.quantized:
+        quant_kwargs = dict(
+            quantized=True,
+            quantized_checkpoints_path=quantized_path,
+            quantization_dtype="f8e4m3",
+            quantization_type="per_channel_symmetric",
+            modules_to_not_convert=["lm_head", "mlp.gate", "o_proj", "shared_experts"],
+        )
+
     neuron_config = MoENeuronConfig(
-        tp_degree=32,   
-        moe_tp_degree=8,                
-        moe_ep_degree=4,                
-        cp_degree=1,                   
-        attention_dp_degree=1,         
-        logical_nc_config=1,           
+        tp_degree=32,
+        moe_tp_degree=8,
+        moe_ep_degree=4,
+        cp_degree=1,
+        attention_dp_degree=1,
+        logical_nc_config=1,
         batch_size=args.batch_size,
-        max_context_length=1024,       
+        max_context_length=1024,
         seq_len=2048,
-        torch_dtype=torch.bfloat16,    
-        
+        torch_dtype=torch.bfloat16,
+
         fused_qkv=False,
-        qkv_kernel_enabled=False, 
+        qkv_kernel_enabled=False,
         sequence_parallel_enabled=False,
-        shared_experts_sequence_parallel_enabled=False, 
+        shared_experts_sequence_parallel_enabled=False,
         use_index_calc_kernel=False,
         moe_mask_padded_tokens=True,
-        
+
         blockwise_matmul_config={"use_shard_on_intermediate_dynamic_while": False, "skip_dma_token": True},
         on_device_sampling_config=OnDeviceSamplingConfig(
             do_sample=True,
@@ -79,8 +117,9 @@ def main():
             top_p=0.95,
             temperature=0.8
         ),
-        async_mode=True, 
-        padding_side="right"
+        async_mode=True,
+        padding_side="right",
+        **quant_kwargs,
     )
 
     inference_config = SolarOpenInferenceConfig(
@@ -212,7 +251,7 @@ def main():
         print("\nWarning: The model did not terminate normally with the <|end|> token (e.g., reached max_new_tokens)")
 
     print("\n====================== Starting Performance Benchmark ======================")
-    report_path = f"solar_open_100b_benchmark_report_{args.num_layers if args.num_layers else 'full'}.json"
+    report_path = f"solar_open_100b_benchmark_report_{args.num_layers if args.num_layers else 'full'}{quant_tag}.json"
 
     generation_config.max_new_tokens = 1024
 

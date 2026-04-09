@@ -305,11 +305,12 @@ class NeuronSolarOpenForCausalLM(NeuronBaseForCausalLM):
     def load_hf_model(model_path, **kwargs):
         from transformers import AutoModelForCausalLM
         hf_model = AutoModelForCausalLM.from_pretrained(
-            model_path, 
+            model_path,
             low_cpu_mem_usage=True,
-            torch_dtype=torch.bfloat16
+            torch_dtype=torch.bfloat16,
+            trust_remote_code=True,
         )
-        
+
         return hf_model
 
     @classmethod
@@ -410,9 +411,93 @@ def _helper_concat_and_delete_qkv(state_dict: Dict[str, Any], layer_num: int, ke
     state_dict[qkv_key] = torch.cat([state_dict[q_key], state_dict[k_key], state_dict[v_key]], dim=0)
     del state_dict[q_key], state_dict[k_key], state_dict[v_key]
 
+
+def _merge_expert_weights(
+    neuron_state_dict: Dict[str, Any],
+    layer_idx: int,
+    num_experts: int,
+    moe_intermediate_size: int,
+    is_quantized: bool,
+    ep_degree: int = 1,
+) -> None:
+    l = layer_idx
+    gate_proj_0 = neuron_state_dict[f"layers.{l}.mlp.experts.0.gate_proj.weight"]
+    intermediate_size_e, hidden_size = gate_proj_0.shape
+    device, dtype = gate_proj_0.device, gate_proj_0.dtype
+    pad_size = max(moe_intermediate_size - intermediate_size_e, 0)
+
+    gate_up_proj = torch.empty(num_experts, hidden_size, 2 * intermediate_size_e, dtype=dtype, device=device)
+    down_proj = torch.empty(num_experts, intermediate_size_e, hidden_size, dtype=dtype, device=device)
+
+    has_scales = is_quantized and (f"layers.{l}.mlp.experts.0.gate_proj.scale" in neuron_state_dict)
+    if has_scales:
+        gate_up_scale = torch.empty(num_experts, 2 * intermediate_size_e, dtype=torch.float32, device=device)
+        down_scale = torch.empty(num_experts, hidden_size, dtype=torch.float32, device=device)
+
+    for e in range(num_experts):
+        gate_w = neuron_state_dict.pop(f"layers.{l}.mlp.experts.{e}.gate_proj.weight").T.detach().clone()
+        up_w = neuron_state_dict.pop(f"layers.{l}.mlp.experts.{e}.up_proj.weight").T.detach().clone()
+        down_w = neuron_state_dict.pop(f"layers.{l}.mlp.experts.{e}.down_proj.weight").T.detach().clone()
+
+        gate_up_slice = torch.narrow(gate_up_proj, 0, e, 1)
+        torch.narrow(gate_up_slice, 2, 0, intermediate_size_e).copy_(gate_w)
+        torch.narrow(gate_up_slice, 2, intermediate_size_e, intermediate_size_e).copy_(up_w)
+        torch.narrow(down_proj, 0, e, 1).copy_(down_w)
+
+        if has_scales:
+            gate_s = neuron_state_dict.pop(f"layers.{l}.mlp.experts.{e}.gate_proj.scale").detach().clone()
+            up_s = neuron_state_dict.pop(f"layers.{l}.mlp.experts.{e}.up_proj.scale").detach().clone()
+            down_s = neuron_state_dict.pop(f"layers.{l}.mlp.experts.{e}.down_proj.scale").detach().clone()
+            gate_up_scale[e] = torch.cat([gate_s.flatten(), up_s.flatten()])
+            down_scale[e] = down_s.flatten()
+
+    if pad_size > 0:
+        gate_up_proj = torch.nn.functional.pad(
+            gate_up_proj.reshape(num_experts, hidden_size, 2, intermediate_size_e), (0, pad_size)
+        ).reshape(num_experts, hidden_size, -1)
+        down_proj = torch.nn.functional.pad(down_proj, (0, 0, 0, pad_size))
+        if has_scales:
+            gate_up_scale = torch.nn.functional.pad(
+                gate_up_scale.reshape(num_experts, 2, intermediate_size_e), (0, pad_size), value=1.0
+            ).reshape(num_experts, -1)
+    else:
+        gate_up_proj = gate_up_proj.reshape(num_experts, hidden_size, -1)
+
+    neuron_state_dict[f"layers.{l}.mlp.expert_mlps.mlp_op.gate_up_proj.weight"] = gate_up_proj
+    neuron_state_dict[f"layers.{l}.mlp.expert_mlps.mlp_op.down_proj.weight"] = down_proj
+
+    if has_scales:
+        experts_per_ep = num_experts // ep_degree
+        fp8_dtype = gate_up_proj.dtype
+
+        for name, weight, scale_2d in [
+            ("gate_up_proj", f"layers.{l}.mlp.expert_mlps.mlp_op.gate_up_proj.weight", gate_up_scale),
+            ("down_proj", f"layers.{l}.mlp.expert_mlps.mlp_op.down_proj.weight", down_scale),
+        ]:
+            w = neuron_state_dict[weight]  # [E, *, dim]  fp8
+            # EP max scale: [ep, dim]
+            ep_max_scale = scale_2d.reshape(ep_degree, experts_per_ep, -1).max(dim=1).values
+
+            for ep_idx in range(ep_degree):
+                ep_start = ep_idx * experts_per_ep
+                ep_end = ep_start + experts_per_ep
+                max_s = ep_max_scale[ep_idx]  # [dim]
+
+                for e in range(ep_start, ep_end):
+                    expert_s = scale_2d[e]  # [dim]
+                    # dequant → requant with max_scale
+                    float_w = w[e].to(torch.float32) * expert_s.unsqueeze(0)
+                    rescaled = float_w / max_s.unsqueeze(0)
+                    w[e] = rescaled.clamp(-240, 240).to(fp8_dtype)
+
+            neuron_state_dict[weight] = w
+            neuron_state_dict[weight.replace(".weight", ".scale")] = ep_max_scale.unsqueeze(1)
+
+
 def convert_solar_open_hf_to_neuron_state_dict(neuron_state_dict: Dict[str, Any], config: "SolarOpenInferenceConfig") -> Dict[str, Any]:
     assert config.neuron_config.glu_mlp is True, "Only GLU MLP is supported"
 
+    is_quantized = getattr(config.neuron_config, "quantized", False)
     _per_expert_format = f"layers.0.mlp.experts.0.gate_proj.weight" in neuron_state_dict
     neuron_state_dict["rank_util.rank"] = torch.arange(0, config.neuron_config.tp_degree, dtype=torch.int32)
     num_moe_experts = config.n_routed_experts
@@ -420,16 +505,17 @@ def convert_solar_open_hf_to_neuron_state_dict(neuron_state_dict: Dict[str, Any]
     for l in range(config.num_hidden_layers):
         neuron_state_dict[f"layers.{l}.self_attn.rank_util.rank"] = torch.arange(0, config.neuron_config.tp_degree, dtype=torch.int32)
 
-        o_key = f"layers.{l}.self_attn.o_proj.weight"
-        if o_key in neuron_state_dict:
-            neuron_state_dict[f"layers.{l}.self_attn.o_proj.o_proj.weight"] = neuron_state_dict.pop(o_key)
+        for suffix in ["weight", "scale"]:
+            o_key = f"layers.{l}.self_attn.o_proj.{suffix}"
+            if o_key in neuron_state_dict:
+                neuron_state_dict[f"layers.{l}.self_attn.o_proj.o_proj.{suffix}"] = neuron_state_dict.pop(o_key)
 
         if not config.neuron_config.fused_qkv:
-            for proj in ["q_proj", "k_proj", "v_proj"]:
-                proj_key = f"layers.{l}.self_attn.{proj}.weight"
-                if proj_key in neuron_state_dict:
-                    neuron_state_dict[f"layers.{l}.self_attn.qkv_proj.{proj}.weight"] = neuron_state_dict.pop(proj_key)
-
+            for suffix in ["weight", "scale"]:
+                for proj in ["q_proj", "k_proj", "v_proj"]:
+                    proj_key = f"layers.{l}.self_attn.{proj}.{suffix}"
+                    if proj_key in neuron_state_dict:
+                        neuron_state_dict[f"layers.{l}.self_attn.qkv_proj.{proj}.{suffix}"] = neuron_state_dict.pop(proj_key)
 
         if getattr(config, "use_qk_norm", False):
             q_norm_key = f"layers.{l}.self_attn.q_norm.weight"
@@ -441,42 +527,18 @@ def convert_solar_open_hf_to_neuron_state_dict(neuron_state_dict: Dict[str, Any]
 
         gate_weight_key = f"layers.{l}.mlp.gate.weight"
         if gate_weight_key in neuron_state_dict:
-            neuron_state_dict[f"layers.{l}.mlp.router.linear_router.weight"] = neuron_state_dict[gate_weight_key].detach().clone()
-            del neuron_state_dict[gate_weight_key]
+            neuron_state_dict[f"layers.{l}.mlp.router.linear_router.weight"] = neuron_state_dict.pop(gate_weight_key).detach().clone()
 
         bias_key = f"layers.{l}.mlp.gate.e_score_correction_bias"
         if bias_key in neuron_state_dict:
-            neuron_state_dict[f"layers.{l}.mlp.router.e_score_correction_bias"] = neuron_state_dict[bias_key].detach().clone().to(torch.float32)
-            del neuron_state_dict[bias_key]
+            neuron_state_dict[f"layers.{l}.mlp.router.e_score_correction_bias"] = neuron_state_dict.pop(bias_key).detach().clone().to(torch.float32)
 
         if _per_expert_format:
-            gate_proj_0 = neuron_state_dict[f"layers.{l}.mlp.experts.0.gate_proj.weight"]
-            intermediate_size_e, hidden_size = gate_proj_0.shape
-            device, dtype = gate_proj_0.device, gate_proj_0.dtype
-            pad_size = max(config.moe_intermediate_size - intermediate_size_e, 0)
-
-            gate_up_proj = torch.empty(num_moe_experts, hidden_size, 2 * intermediate_size_e, dtype=dtype, device=device)
-            down_proj = torch.empty(num_moe_experts, intermediate_size_e, hidden_size, dtype=dtype, device=device)
-
-            for e in range(num_moe_experts):
-                gate_w = neuron_state_dict[f"layers.{l}.mlp.experts.{e}.gate_proj.weight"].T.detach().clone()
-                up_w = neuron_state_dict[f"layers.{l}.mlp.experts.{e}.up_proj.weight"].T.detach().clone()
-                down_w = neuron_state_dict[f"layers.{l}.mlp.experts.{e}.down_proj.weight"].T.detach().clone()
-
-                gate_up_slice = torch.narrow(gate_up_proj, 0, e, 1)
-                torch.narrow(gate_up_slice, 2, 0, intermediate_size_e).copy_(gate_w)
-                torch.narrow(gate_up_slice, 2, intermediate_size_e, intermediate_size_e).copy_(up_w)
-                torch.narrow(down_proj, 0, e, 1).copy_(down_w)
-
-                del neuron_state_dict[f"layers.{l}.mlp.experts.{e}.gate_proj.weight"], neuron_state_dict[f"layers.{l}.mlp.experts.{e}.up_proj.weight"], neuron_state_dict[f"layers.{l}.mlp.experts.{e}.down_proj.weight"]
-
-            if pad_size > 0:
-                gate_up_proj = torch.nn.functional.pad(gate_up_proj.reshape(num_moe_experts, hidden_size, 2, intermediate_size_e), (0, pad_size))
-                down_proj = torch.nn.functional.pad(down_proj, (0, 0, 0, pad_size))
-            gate_up_proj = gate_up_proj.reshape(num_moe_experts, hidden_size, -1)
-            
-            neuron_state_dict[f"layers.{l}.mlp.expert_mlps.mlp_op.gate_up_proj.weight"] = gate_up_proj
-            neuron_state_dict[f"layers.{l}.mlp.expert_mlps.mlp_op.down_proj.weight"] = down_proj
+            _merge_expert_weights(
+                neuron_state_dict, l, num_moe_experts,
+                config.moe_intermediate_size, is_quantized,
+                ep_degree=config.neuron_config.moe_ep_degree,
+            )
         else:
             gate_up_key = f"layers.{l}.mlp.experts.gate_up_proj"
             if gate_up_key in neuron_state_dict:
@@ -500,21 +562,24 @@ def convert_solar_open_hf_to_neuron_state_dict(neuron_state_dict: Dict[str, Any]
 
         for proj in ["gate_proj", "up_proj"]:
             proj_key = f"layers.{l}.mlp.shared_experts.{proj}.weight"
+            scale_key = f"layers.{l}.mlp.shared_experts.{proj}.scale"
             if proj_key in neuron_state_dict:
                 w = neuron_state_dict[proj_key]
                 if len(w.shape) > 1:
                     shared_pad_size = max(config.intermediate_size - w.shape[0], 0)
-                    if shared_pad_size > 0: neuron_state_dict[proj_key] = torch.nn.functional.pad(w, (0, 0, 0, shared_pad_size))
-        
-        down_key = f"layers.{l}.mlp.shared_experts.down_proj.weight"
+                    if shared_pad_size > 0:
+                        neuron_state_dict[proj_key] = torch.nn.functional.pad(w, (0, 0, 0, shared_pad_size))
+                        if scale_key in neuron_state_dict:
+                            s = neuron_state_dict[scale_key]
+                            neuron_state_dict[scale_key] = torch.nn.functional.pad(s, (0, 0, 0, shared_pad_size), value=1.0)
 
+        down_key = f"layers.{l}.mlp.shared_experts.down_proj.weight"
         if down_key in neuron_state_dict:
             w = neuron_state_dict[down_key]
             if len(w.shape) > 1:
                 shared_pad_size = max(config.intermediate_size - w.shape[1], 0)
-                if shared_pad_size > 0: 
+                if shared_pad_size > 0:
                     w = torch.nn.functional.pad(w, (0, shared_pad_size))
-             
             neuron_state_dict[down_key] = w
 
     keys_to_delete = []
@@ -523,7 +588,7 @@ def convert_solar_open_hf_to_neuron_state_dict(neuron_state_dict: Dict[str, Any]
             parts = key.split(".")
             if len(parts) > 1 and parts[1].isdigit() and int(parts[1]) >= config.num_hidden_layers:
                 keys_to_delete.append(key)
-                       
+
     for key in keys_to_delete:
         if key in neuron_state_dict: del neuron_state_dict[key]
     gc.collect()
@@ -531,5 +596,7 @@ def convert_solar_open_hf_to_neuron_state_dict(neuron_state_dict: Dict[str, Any]
     if config.neuron_config.fused_qkv:
         for l in range(config.num_hidden_layers):
             _helper_concat_and_delete_qkv(neuron_state_dict, l, "weight")
+            if is_quantized:
+                _helper_concat_and_delete_qkv(neuron_state_dict, l, "scale")
 
     return neuron_state_dict
