@@ -26,11 +26,12 @@ Architecture notes vs GLM-4.5 MoE (which is the primary template):
   - rope_scaling: None → plain RotaryEmbedding; {"type":"yarn"} → YaRN RoPE
   - Router: same sigmoid + group routing + e_score_correction_bias + routed_scaling_factor
     as GLM-4.5 (NeuronGlm4MoeRouter is reused directly)
-  - solar_open is not in transformers stable releases (≤4.56.2) but has been merged
-    into transformers main; load_hf_model loads safetensors directly for now
+  - solar_open is a built-in transformers model (SolarOpenForCausalLM, available
+    since transformers 4.57+); no trust_remote_code needed
 """
 
 import gc
+import logging
 import warnings
 import math
 from typing import List, Optional, Tuple, Union, Dict, Any
@@ -108,6 +109,76 @@ _flash_fwd_call = nki_jit()(attention_isa_kernel)
 SampleOutput = Union[SampleEncoderDecoderOutput, SampleDecoderOnlyOutput]
 
 GQA_SHARDING_STRATEGY = GQA.REPLICATE_TO_TP_DEGREE
+
+logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Sigmoid routing patch for fused TKG kernel
+# ---------------------------------------------------------------------------
+# The fused MoE TKG NKI kernel's router only supports softmax.
+# Solar Open uses sigmoid routing. Patch to force ISA router fallback.
+# Same pattern as Trinity and GLM-5 contrib models.
+
+
+class _PatchedKernelCall:
+    """Wrapper that injects ``use_router_topk_nki_kernel=False`` into every call."""
+
+    def __init__(self, original):
+        self._original = original
+
+    def __getitem__(self, grid):
+        original_grid_call = self._original[grid]
+
+        def patched_call(*args, **kwargs):
+            kwargs["use_router_topk_nki_kernel"] = False
+            try:
+                return original_grid_call(*args, **kwargs)
+            except TypeError:
+                # Older SDK versions may not support the kwarg — fall back
+                kwargs.pop("use_router_topk_nki_kernel", None)
+                return original_grid_call(*args, **kwargs)
+
+        return patched_call
+
+
+def _patch_fused_tkg_for_sigmoid():
+    """Patch MoEFusedTKG kernel to use ISA router fallback for sigmoid routing.
+
+    Idempotent: safe to call multiple times (double-wrapping is guarded).
+    """
+    try:
+        import neuronx_distributed.modules.moe.moe_fused_tkg as fused_tkg_mod
+
+        original_kernel = fused_tkg_mod._moe_token_gen_selective_load_kernel_nki_call
+        if original_kernel is None:
+            logger.warning(
+                "Fused TKG selective load kernel not available, skipping patch"
+            )
+            return
+
+        # Idempotency guard: skip if already patched
+        if isinstance(original_kernel, _PatchedKernelCall):
+            logger.debug("Sigmoid TKG patch already applied, skipping")
+            return
+
+        fused_tkg_mod._moe_token_gen_selective_load_kernel_nki_call = (
+            _PatchedKernelCall(original_kernel)
+        )
+
+        original_all = fused_tkg_mod._moe_tkg_forward_all_experts_nki_call
+        if original_all is not None and not isinstance(
+            original_all, _PatchedKernelCall
+        ):
+            fused_tkg_mod._moe_tkg_forward_all_experts_nki_call = _PatchedKernelCall(
+                original_all
+            )
+
+        logger.warning("Patched MoEFusedTKG for sigmoid routing (ISA fallback)")
+    except ImportError:
+        logger.info("moe_fused_tkg module not available (SDK < 2.28), skipping patch")
+    except Exception as e:
+        logger.warning("Failed to patch MoEFusedTKG for sigmoid: %s", e)
 
 
 # ---------------------------------------------------------------------------
@@ -584,6 +655,13 @@ class NeuronSolarOpenForCausalLM(NeuronBaseForCausalLM):
     """Solar Open MoE CausalLM for NXD inference."""
 
     _model_cls = NeuronSolarOpenModel
+
+    def __init__(self, *args, **kwargs):
+        # Apply sigmoid routing patch before base class constructs the model.
+        # Scoped here (not at module level) so importing this module does not
+        # affect other MoE models that use softmax routing in the same process.
+        _patch_fused_tkg_for_sigmoid()
+        super().__init__(*args, **kwargs)
 
     @staticmethod
     def load_hf_model(model_path, **kwargs):
